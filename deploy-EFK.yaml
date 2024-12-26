@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-deployment
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      volumes:
+      - name: app-storage
+        persistentVolumeClaim:
+          claimName: app-pvc
+      - name: shared-logs
+        emptyDir: {}
+      - name: fluentd-config
+        configMap:
+          name: fluentd-config
+      
+      containers:
+      - name: myapp
+        image: myapp:1.0.0
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        envFrom:
+        - configMapRef:
+            name: app-config
+        - secretRef:
+            name: app-secrets
+        volumeMounts:
+        - name: app-storage
+          mountPath: /app/data
+        - name: shared-logs
+          mountPath: /var/log/app
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+      # Sidecar container for log collection
+      - name: fluentd-sidecar
+        image: fluent/fluentd:v1.16
+        resources:
+          limits:
+            memory: "200Mi"
+            cpu: "200m"
+          requests:
+            memory: "100Mi"
+            cpu: "100m"
+        env:
+        - name: ELASTICSEARCH_HOST
+          value: "elasticsearch-service"
+        - name: ELASTICSEARCH_PORT
+          value: "9200"
+        volumeMounts:
+        - name: shared-logs
+          mountPath: /var/log/containers/app
+          readOnly: true
+        - name: fluentd-config
+          mountPath: /fluentd/etc
+        livenessProbe:
+          exec:
+            command:
+            - "/bin/sh"
+            - "-c"
+            - "ps aux | grep -v grep | grep fluentd"
+          initialDelaySeconds: 10
+          periodSeconds: 30
