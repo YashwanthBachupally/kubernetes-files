@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-vault-creds
+spec:
+  # Init container runs first and sets up credentials
+  initContainers:
+  - name: vault-cred-initializer
+    image: vault:latest
+    command: 
+    - /bin/sh
+    - -c
+    args:
+    - |
+      # Authenticate with Vault using Kubernetes service account
+      jwt=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+      vault write auth/kubernetes/login role=myapp jwt=$jwt
+
+      # Get secrets from Vault and write to shared volume
+      vault kv get -field=username secret/myapp/credentials > /vault/secrets/username
+      vault kv get -field=password secret/myapp/credentials > /vault/secrets/password
+      
+      # Set proper permissions
+      chmod 400 /vault/secrets/*
+    env:
+    - name: VAULT_ADDR
+      value: "http://vault:8200"
+    volumeMounts:
+    - name: vault-secrets
+      mountPath: /vault/secrets
+    - name: vault-token
+      mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      readOnly: true
+
+  # Main application container
+  containers:
+  - name: myapp
+    image: myapp:latest
+    volumeMounts:
+    - name: vault-secrets
+      mountPath: /app/secrets
+      readOnly: true
+    env:
+    - name: USERNAME_FILE
+      value: /app/secrets/username
+    - name: PASSWORD_FILE
+      value: /app/secrets/password
+
+  # Volumes shared between init container and main container
+  volumes:
+  - name: vault-secrets
+    emptyDir:
+      medium: Memory
+  - name: vault-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          expirationSeconds: 7200
+          audience: vault
