@@ -1,0 +1,386 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: your-namespace
+  labels:
+    app.kubernetes.io/part-of: your-app-suite
+    environment: prod
+---
+# (Optional) PriorityClass for critical workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 100000
+globalDefault: false
+description: "High priority for user-facing workloads"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: your-app-sa
+  namespace: your-namespace
+  annotations:
+    # If you're on AWS (Kops/EKS) and using IRSA to access Secrets Manager/S3/etc:
+    # eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/YourAppRuntimeRole
+automountServiceAccountToken: true
+---
+# NetworkPolicy: deny-all by default, then explicitly allow app ingress/egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: your-namespace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-app-traffic
+  namespace: your-namespace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: your-app
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        # Allow from same namespace workloads with label (e.g., API gateway)
+        - namespaceSelector:
+            matchLabels:
+              environment: prod
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ingress
+        # Allow from cluster ingress controllers (namespace or label accordingly)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        # Allow DNS (CoreDNS)
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    - to:
+        # Allow outbound to RDS (replace with your DB host CIDR or use egress gateway)
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 3306
+    - to:
+        # (Optional) Allow metrics/trace backends, queues, etc.
+        - ipBlock:
+            cidr: 10.1.0.0/16
+      ports:
+        - protocol: TCP
+          port: 9092
+---
+# ConfigMap for non-secret config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: your-app-config
+  namespace: your-namespace
+data:
+  APP_LOG_LEVEL: "info"
+  APP_FEATURE_FLAG_X: "false"
+---
+# ExternalSecret: sync from external store (AWS Secrets Manager / Vault / etc.)
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: aws-secret-store
+  namespace: your-namespace
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: YOUR_AWS_REGION
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: your-app-sa
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: your-app-secrets
+  namespace: your-namespace
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secret-store
+    kind: SecretStore
+  target:
+    name: your-app-secret                # K8s Secret created by ESO
+    creationPolicy: Owner
+    template:
+      type: Opaque
+  data:
+    - secretKey: DB_HOST
+      remoteRef:
+        key: prod/your-app/db
+        property: host
+    - secretKey: DB_PORT
+      remoteRef:
+        key: prod/your-app/db
+        property: port
+    - secretKey: DB_USER
+      remoteRef:
+        key: prod/your-app/db
+        property: username
+    - secretKey: DB_PASSWORD
+      remoteRef:
+        key: prod/your-app/db
+        property: password
+    - secretKey: DB_NAME
+      remoteRef:
+        key: prod/your-app/db
+        property: name
+---
+# PodDisruptionBudget ensures at least N pods remain during voluntary disruptions
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: your-app-pdb
+  namespace: your-namespace
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: your-app
+---
+# Service (ClusterIP). Adjust to LoadBalancer/NodePort/Ingress as needed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: your-app
+  namespace: your-namespace
+  labels:
+    app.kubernetes.io/name: your-app
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: your-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+# Deployment with strong production defaults
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: your-app
+  namespace: your-namespace
+  labels:
+    app.kubernetes.io/name: your-app
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: web
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: your-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: your-app
+        app.kubernetes.io/component: web
+      annotations:
+        # Enable Prometheus scraping (if you expose /metrics)
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8080"
+        # Example: checksum to roll pods on ConfigMap change
+        # configmap.reloader.stakater.com/reload: "your-app-config"
+    spec:
+      serviceAccountName: your-app-sa
+      priorityClassName: high-priority
+      terminationGracePeriodSeconds: 30
+      # Spread across zones/nodes to improve HA
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: your-app
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: your-app
+      # (Optional) Tolerations if you run tainted nodes
+      # tolerations:
+      #   - key: "workload"
+      #     operator: "Equal"
+      #     value: "frontend"
+      #     effect: "NoSchedule"
+      dnsPolicy: ClusterFirst
+      containers:
+        - name: your-app
+          image: your-registry/your-app:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          # Health probes (tune paths/timeouts to your app)
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 1
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          envFrom:
+            - configMapRef:
+                name: your-app-config
+          env:
+            # Non-secret config overrides (optional)
+            - name: APP_ENV
+              value: "prod"
+            # Secrets synced by ExternalSecret → K8s Secret
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: your-app-secret
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: your-app-secret
+                  key: DB_PORT
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: your-app-secret
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: your-app-secret
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: your-app-secret
+                  key: DB_NAME
+          # Secure default FS permissions
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            # If you want files for certs/ca bundles etc.
+            # - name: ca-bundle
+            #   mountPath: /etc/ssl/certs
+            #   readOnly: true
+      securityContext:
+        fsGroup: 10001
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # - name: ca-bundle
+        #   configMap:
+        #     name: your-ca-bundle
+---
+# HorizontalPodAutoscaler (v2) — CPU + optional memory
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: your-app
+  namespace: your-namespace
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: your-app
+  minReplicas: 3
+  maxReplicas: 15
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+---
+# (Optional) ServiceMonitor if you use Prometheus Operator for metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: your-app
+  namespace: your-namespace
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: your-app
+  namespaceSelector:
+    matchNames:
+      - your-namespace
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
